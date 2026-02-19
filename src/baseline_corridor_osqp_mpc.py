@@ -14,17 +14,17 @@ class MPCConfig:
     vref: float = 0.8  # fixed forward speed used in plant sim + linear model
 
     # Corridor
-    W: float = 2.0
-    margin: float = 0.15
+    W: float = 5.0  # corridor width (m)
+    margin: float = 0.15 # safety margin from walls (for constraints)
 
     # Weights
-    qy: float = 20.0
-    qth: float = 2.0
-    rw: float = 0.2
-    rdw: float = 0.1
+    qy: float = 20.0    # lateral error weight
+    qth: float = 2.0    # heading error weight
+    rw: float = 0.2     # control effort weight
+    rdw: float = 0.1    # delta control weight (smoothness)
 
     # Bounds
-    wmax: float = 1.0
+    wmax: float = 1.0   # max angular velocity (rad/s)
 
 
 class CorridorMPC_OSQP:
@@ -204,7 +204,7 @@ def main():
     W = cfg.W
 
     # Initial robot state in world
-    state = np.array([0.0, 0.6, np.deg2rad(30.0)])  # x, y, theta
+    state = np.array([0.0, 0.6, np.deg2rad(45.0)])  # x, y, theta
     omega_prev = 0.0
 
     T = 18.0
