@@ -28,7 +28,7 @@ class MPCConfig:
 
     # APF (for MPC bias)
     apf_sigma_x: float = 1.8
-    apf_gain: float = 14.0
+    apf_gain: float = 15.0
     apf_pass_offset: float = 1.0
 
     # Potential field visualization
@@ -287,12 +287,15 @@ def main():
     # Define ANY number of people here
     # Each person: start p=[x,y], speed v, direction dir=[dx,dy] in global coords
     people: list[Person] = [
-        Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),   # toward robot
-        Person(p=np.array([12.0, -1.0]), v=0.45, dir=np.array([-1.0, 0.15])), # diagonal toward corridor
-        # Person(p=np.array([10.0,  1.3]), v=0.35, dir=np.array([ 0.0, -1.0])), # crossing down
+        #Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),   # toward robot
+        #Person(p=np.array([12.0, -1.0]), v=0.45, dir=np.array([-1.0, 0.15])), # diagonal toward corridor
+        #Person(p=np.array([10.0,  1.3]), v=0.35, dir=np.array([ 0.0, -1.0])), # crossing down
+        Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),  # toward robot
+        Person(p=np.array([3.0, -1.2]), v=0.4, dir=np.array([ 0.0, 1.0])), # crossing upward
+        Person(p=np.array([18.0,  1.5]), v=0.3, dir=np.array([-1.0, -0.2])),# diagonal
     ]
 
-    T = 18.0
+    T = 25.0
     steps = int(T / cfg.dt)
 
     traj = np.zeros((steps + 1, 3))
