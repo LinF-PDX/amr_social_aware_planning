@@ -28,7 +28,7 @@ class MPCConfig:
 
     # APF (for MPC bias)
     apf_sigma_x: float = 1.8
-    apf_gain: float = 15.0
+    apf_gain: float = 20.0
     apf_pass_offset: float = 1.0
 
     # Potential field visualization
@@ -287,15 +287,15 @@ def main():
     # Define ANY number of people here
     # Each person: start p=[x,y], speed v, direction dir=[dx,dy] in global coords
     people: list[Person] = [
-        #Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),   # toward robot
-        #Person(p=np.array([12.0, -1.0]), v=0.45, dir=np.array([-1.0, 0.15])), # diagonal toward corridor
+        Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),   # toward robot
+        Person(p=np.array([12.0, -1.0]), v=0.45, dir=np.array([-1.0, 0.15])), # diagonal toward corridor
         #Person(p=np.array([10.0,  1.3]), v=0.35, dir=np.array([ 0.0, -1.0])), # crossing down
-        Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),  # toward robot
-        Person(p=np.array([3.0, -1.2]), v=0.4, dir=np.array([ 0.0, 1.0])), # crossing upward
-        Person(p=np.array([18.0,  1.5]), v=0.3, dir=np.array([-1.0, -0.2])),# diagonal
+        #Person(p=np.array([15.0, 0.2]), v=0.6, dir=np.array([-1.0, 0.0])),  # toward robot
+        #Person(p=np.array([3.0, -1.2]), v=0.4, dir=np.array([ 0.0, 1.0])), # crossing upward
+        #Person(p=np.array([18.0,  1.5]), v=0.3, dir=np.array([-1.0, -0.2])),# diagonal
     ]
 
-    T = 25.0
+    T = 20.0
     steps = int(T / cfg.dt)
 
     traj = np.zeros((steps + 1, 3))
@@ -395,14 +395,14 @@ def main():
             pf_objects = []
 
             U_sum = np.zeros_like(X, dtype=float)
-
+            '''
             # per-person contour lines
             for p in people:
                 Ui = person_potential_on_grid(X, Y, p.p, cfg.pf_sigma_x, cfg.pf_sigma_y)
                 U_sum += Ui
                 cs = ax.contour(X, Y, Ui, levels=levels_individual, alpha=cfg.pf_alpha)
                 pf_objects.append(cs)
-
+            '''
             # optional combined filled contour
             if cfg.pf_show_combined:
                 cf = ax.contourf(X, Y, U_sum, levels=levels_combined, alpha=0.18)
