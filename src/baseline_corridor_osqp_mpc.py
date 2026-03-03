@@ -368,7 +368,10 @@ def main():
         )
 
         # Simulate robot
+        # Add gaussian noise to simulate model mismatch + sensing noise
+        noise = np.random.randn(3) * np.array([0.03, 0.03, np.deg2rad(1.0)])
         state = step_unicycle(state, v=cfg.vref, w=omega, dt=cfg.dt)
+        state += noise  # Add noise to the state
         omega_prev = omega
 
         traj[k + 1] = state
