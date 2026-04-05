@@ -28,13 +28,16 @@ class MPCConfig:
     wmax: float = 1.0   # max angular velocity (rad/s)
 
     # APF (for MPC bias)
-    apf_sigma_x: float = 1.8
+    apf_sigma_front: float = 1.8
+    apf_sigma_back: float = 0.9
+    apf_sigma_side: float = 0.9
     apf_gain: float = 20.0
     apf_pass_offset: float = 1.0
 
     # Potential field visualization
-    pf_sigma_x: float = 1.8          # longitudinal spread
-    pf_sigma_y: float = 0.9          # lateral spread
+    pf_sigma_front: float = 1.8      # spread in front of the person
+    pf_sigma_back: float = 0.9       # spread behind the person
+    pf_sigma_side: float = 0.9       # left/right spread
     pf_grid_dx: float = 0.20         # grid resolution x
     pf_grid_dy: float = 0.10         # grid resolution y
     pf_alpha: float = 0.35           # contour alpha for individual fields
@@ -62,6 +65,28 @@ class Person:
 
 def wrap_angle(angle: float) -> float:
     return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def left_normal(direction: np.ndarray) -> np.ndarray:
+    return np.array([-direction[1], direction[0]])
+
+
+def person_frame_coordinates(point: np.ndarray, person_pos: np.ndarray,
+                             person_dir: np.ndarray) -> tuple[float, float]:
+    rel = point - person_pos
+    heading = person_dir
+    lateral_axis = left_normal(heading)
+    longitudinal = float(rel @ heading)
+    lateral = float(rel @ lateral_axis)
+    return longitudinal, lateral
+
+
+def asymmetric_gaussian(longitudinal: np.ndarray | float, lateral: np.ndarray | float,
+                        sigma_front: float, sigma_back: float,
+                        sigma_side: float) -> np.ndarray | float:
+    sigma_long = np.where(np.asarray(longitudinal) >= 0.0, sigma_front, sigma_back)
+    return np.exp(-((np.asarray(longitudinal) / (sigma_long + 1e-9)) ** 2 +
+                    (np.asarray(lateral) / (sigma_side + 1e-9)) ** 2))
 
 
 class UnicycleEKF:
@@ -261,25 +286,34 @@ class CorridorMPC_OSQP:
         y_robot = float(x_init[0])  # e_y = y in straight corridor
 
         for person in people:
-            x_p0, y_p0 = float(person.p[0]), float(person.p[1])
+            p0 = person.p.copy()
+            heading = person.dir.copy()
+            lateral_axis = left_normal(heading)
             vpx, vpy = float(person.v * person.dir[0]), float(person.v * person.dir[1])
 
-            # choose pass side per person based on current relative y
-            side = 1.0 if (y_robot - y_p0) >= 0.0 else -1.0
-            y_des = y_p0 + side * cfg.apf_pass_offset
+            robot_now = np.array([robot_x0, y_robot])
+            _, lateral_now = person_frame_coordinates(robot_now, p0, heading)
+
+            # keep the pass preference left/right symmetric in the person's local frame
+            side = 1.0 if lateral_now >= 0.0 else -1.0
 
             for k in range(N + 1):
-                x_rk = robot_x0 + cfg.vref * cfg.dt * k
-                x_pk = x_p0 + vpx * cfg.dt * k
-                y_pk = y_p0 + vpy * cfg.dt * k
+                robot_nominal = np.array([robot_x0 + cfg.vref * cfg.dt * k, y_robot])
+                person_pred = p0 + np.array([vpx, vpy]) * cfg.dt * k
 
-                dx = x_rk - x_pk
-                alpha = np.exp(-(dx / cfg.apf_sigma_x) ** 2)
+                longitudinal, lateral = person_frame_coordinates(
+                    robot_nominal, person_pred, heading
+                )
+                w = cfg.apf_gain * asymmetric_gaussian(
+                    longitudinal=longitudinal,
+                    lateral=lateral,
+                    sigma_front=cfg.apf_sigma_front,
+                    sigma_back=cfg.apf_sigma_back,
+                    sigma_side=cfg.apf_sigma_side
+                )
 
-                dy0 = (y_robot - y_pk)
-                beta = np.exp(-(dy0 / (cfg.apf_pass_offset + 1e-6)) ** 2)
-
-                w = cfg.apf_gain * alpha * beta
+                desired_pos = person_pred + longitudinal * heading + side * cfg.apf_pass_offset * lateral_axis
+                y_des = float(desired_pos[1])
 
                 ix = k * nx
                 q[ix + 0] += -2.0 * w * y_des
@@ -302,10 +336,15 @@ def step_unicycle(state, v, w, dt):
     return np.array([x, y, th])
 
 
-def person_potential_on_grid(X, Y, person_xy, sx, sy):
-    dx = (X - person_xy[0]) / (sx + 1e-9)
-    dy = (Y - person_xy[1]) / (sy + 1e-9)
-    return np.exp(-(dx * dx + dy * dy))
+def person_potential_on_grid(X, Y, person_xy, person_dir, sigma_front, sigma_back, sigma_side):
+    rel_x = X - person_xy[0]
+    rel_y = Y - person_xy[1]
+    heading = person_dir
+    lateral_axis = left_normal(heading)
+
+    longitudinal = rel_x * heading[0] + rel_y * heading[1]
+    lateral = rel_x * lateral_axis[0] + rel_y * lateral_axis[1]
+    return asymmetric_gaussian(longitudinal, lateral, sigma_front, sigma_back, sigma_side)
 
 
 def _remove_contour_objects(objs):
@@ -483,14 +522,17 @@ def main():
             pf_objects = []
 
             U_sum = np.zeros_like(X, dtype=float)
-            '''
+
             # per-person contour lines
             for p in people:
-                Ui = person_potential_on_grid(X, Y, p.p, cfg.pf_sigma_x, cfg.pf_sigma_y)
+                Ui = person_potential_on_grid(
+                    X, Y, p.p, p.dir,
+                    cfg.pf_sigma_front, cfg.pf_sigma_back, cfg.pf_sigma_side
+                )
                 U_sum += Ui
                 cs = ax.contour(X, Y, Ui, levels=levels_individual, alpha=cfg.pf_alpha)
                 pf_objects.append(cs)
-            '''
+
             # optional combined filled contour
             if cfg.pf_show_combined:
                 cf = ax.contourf(X, Y, U_sum, levels=levels_combined, alpha=0.18)
@@ -577,5 +619,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
