@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
 import osqp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -31,7 +31,7 @@ class MPCConfig:
     apf_sigma_front: float = 1.8
     apf_sigma_back: float = 0.9
     apf_sigma_side: float = 0.9
-    apf_gain: float = 20.0
+    apf_gain: float = 15.0
     apf_pass_offset: float = 1.0
 
     # Potential field visualization
@@ -46,8 +46,19 @@ class MPCConfig:
 
     # Estimation
     process_noise_std: tuple[float, float, float] = (0.05, 0.05, np.deg2rad(0.4))
-    measurement_noise_std: tuple[float, float, float] = (0.08, 0.08, np.deg2rad(1.0))
+    measurement_noise_std: tuple[float, float, float] = (0.03, 0.03, np.deg2rad(1.0))
     random_seed: int = 7
+
+    # Person reaction to AMR
+    person_reaction_front_sigma: float = 2.6
+    person_reaction_back_sigma: float = 0.4
+    person_reaction_side_sigma: float = 1.0
+    person_reaction_turn_gain: float = 1.3
+    person_reaction_slow_gain: float = 0.8
+    person_reaction_min_speed: float = 0.08
+    person_reaction_turn_rate: float = 5.0
+    person_reaction_speed_rate: float = 4.0
+    person_reaction_closing_speed: float = 0.05
 
 
 @dataclass
@@ -55,12 +66,17 @@ class Person:
     p: np.ndarray      # current position [x, y]
     v: float           # constant speed (m/s)
     dir: np.ndarray    # direction [dx, dy], will be normalized
+    v_nominal: float = field(init=False)
+    dir_nominal: np.ndarray = field(init=False)
 
     def __post_init__(self):
         n = float(np.linalg.norm(self.dir))
         if n < 1e-9:
             raise ValueError("Person.dir must be non-zero")
         self.dir = self.dir / n
+        self.v = float(self.v)
+        self.v_nominal = self.v
+        self.dir_nominal = self.dir.copy()
 
 
 def wrap_angle(angle: float) -> float:
@@ -69,6 +85,13 @@ def wrap_angle(angle: float) -> float:
 
 def left_normal(direction: np.ndarray) -> np.ndarray:
     return np.array([-direction[1], direction[0]])
+
+
+def normalize_vector(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-9:
+        return vector.copy()
+    return vector / norm
 
 
 def person_frame_coordinates(point: np.ndarray, person_pos: np.ndarray,
@@ -139,6 +162,53 @@ class UnicycleEKF:
 
 def step_person_straight(person: Person, dt: float) -> None:
     """In-place update: straight-line motion at constant speed."""
+    person.p = person.p + person.v * person.dir * dt
+
+
+def step_person_reactive(person: Person, robot_state: np.ndarray, robot_speed: float,
+                         cfg: MPCConfig, dt: float) -> None:
+    """Update a person with a simple front-aware sidestep + slowdown reaction."""
+    robot_pos = robot_state[:2]
+    robot_heading = np.array([np.cos(robot_state[2]), np.sin(robot_state[2])])
+    robot_vel = robot_speed * robot_heading
+
+    longitudinal, lateral = person_frame_coordinates(robot_pos, person.p, person.dir_nominal)
+    rel = robot_pos - person.p
+    dist = float(np.linalg.norm(rel))
+
+    if dist > 1e-9:
+        rel_hat = rel / dist
+        person_vel = person.v * person.dir
+        closing_speed = max(0.0, -float(rel_hat @ (robot_vel - person_vel)))
+    else:
+        closing_speed = robot_speed
+
+    threat = float(asymmetric_gaussian(
+        longitudinal=longitudinal,
+        lateral=lateral,
+        sigma_front=cfg.person_reaction_front_sigma,
+        sigma_back=cfg.person_reaction_back_sigma,
+        sigma_side=cfg.person_reaction_side_sigma
+    ))
+    if closing_speed <= cfg.person_reaction_closing_speed:
+        threat = 0.0
+
+    nominal_dir = person.dir_nominal
+    nominal_left = left_normal(nominal_dir)
+    side_away = -1.0 if lateral >= 0.0 else 1.0
+
+    desired_dir = normalize_vector(
+        nominal_dir + cfg.person_reaction_turn_gain * threat * side_away * nominal_left
+    )
+    desired_speed = max(
+        cfg.person_reaction_min_speed,
+        person.v_nominal * (1.0 - cfg.person_reaction_slow_gain * threat)
+    )
+
+    turn_blend = np.clip(cfg.person_reaction_turn_rate * dt, 0.0, 1.0)
+    speed_blend = np.clip(cfg.person_reaction_speed_rate * dt, 0.0, 1.0)
+    person.dir = normalize_vector((1.0 - turn_blend) * person.dir + turn_blend * desired_dir)
+    person.v = (1.0 - speed_blend) * person.v + speed_blend * desired_speed
     person.p = person.p + person.v * person.dir * dt
 
 
@@ -471,7 +541,7 @@ def main():
     for k in range(steps):
         # propagate all people
         for i, p in enumerate(people):
-            step_person_straight(p, cfg.dt)
+            step_person_reactive(p, true_state, cfg.vref, cfg, cfg.dt)
             people_traj[i][k + 1] = p.p.copy()
 
         # MPC solve
