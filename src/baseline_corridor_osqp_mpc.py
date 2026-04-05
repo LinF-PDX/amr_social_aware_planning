@@ -4,6 +4,7 @@ import scipy.sparse as sp
 import matplotlib.pyplot as plt
 import osqp
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -40,6 +41,11 @@ class MPCConfig:
     pf_draw_every: int = 1           # draw PF every N frames (increase if slow)
     pf_show_combined: bool = True    # show summed field as filled contour
 
+    # Estimation
+    process_noise_std: tuple[float, float, float] = (0.05, 0.05, np.deg2rad(0.4))
+    measurement_noise_std: tuple[float, float, float] = (0.08, 0.08, np.deg2rad(1.0))
+    random_seed: int = 7
+
 
 @dataclass
 class Person:
@@ -52,6 +58,58 @@ class Person:
         if n < 1e-9:
             raise ValueError("Person.dir must be non-zero")
         self.dir = self.dir / n
+
+
+def wrap_angle(angle: float) -> float:
+    return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+class UnicycleEKF:
+    """EKF for state [x, y, theta] with direct noisy measurement of the same state."""
+
+    def __init__(self, dt: float, process_std: tuple[float, float, float],
+                 measurement_std: tuple[float, float, float]):
+        self.dt = dt
+        self.Q = np.diag(np.square(process_std))
+        self.R = np.diag(np.square(measurement_std))
+        self.H = np.eye(3)
+        self.state = np.zeros(3)
+        self.P = np.eye(3)
+
+    def initialize(self, measurement: np.ndarray, covariance_scale: float = 1.0) -> None:
+        self.state = measurement.copy()
+        self.state[2] = wrap_angle(self.state[2])
+        self.P = covariance_scale * self.R.copy()
+
+    def predict(self, v: float, w: float) -> None:
+        x, y, th = self.state
+        dt = self.dt
+
+        self.state = np.array([
+            x + v * np.cos(th) * dt,
+            y + v * np.sin(th) * dt,
+            wrap_angle(th + w * dt)
+        ])
+
+        F = np.array([
+            [1.0, 0.0, -v * np.sin(th) * dt],
+            [0.0, 1.0,  v * np.cos(th) * dt],
+            [0.0, 0.0, 1.0]
+        ])
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, measurement: np.ndarray) -> None:
+        innovation = measurement - self.H @ self.state
+        innovation[2] = wrap_angle(innovation[2])
+
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        self.state = self.state + K @ innovation
+        self.state[2] = wrap_angle(self.state[2])
+
+        I = np.eye(3)
+        self.P = (I - K @ self.H) @ self.P
 
 
 def step_person_straight(person: Person, dt: float) -> None:
@@ -240,7 +298,7 @@ def step_unicycle(state, v, w, dt):
     x += v * np.cos(th) * dt
     y += v * np.sin(th) * dt
     th += w * dt
-    th = (th + np.pi) % (2 * np.pi) - np.pi
+    th = wrap_angle(th)
     return np.array([x, y, th])
 
 
@@ -275,13 +333,23 @@ def _remove_contour_objects(objs):
 def main():
     cfg = MPCConfig()
     mpc = CorridorMPC_OSQP(cfg)
+    ekf = UnicycleEKF(
+        dt=cfg.dt,
+        process_std=cfg.process_noise_std,
+        measurement_std=cfg.measurement_noise_std
+    )
+    rng = np.random.default_rng(cfg.random_seed)
+    is_headless = "agg" in plt.get_backend().lower()
 
     # Scene
     L = 20.0
     W = cfg.W
 
     # Initial robot state in world
-    state = np.array([0.0, 0.6, np.deg2rad(45.0)])  # x, y, theta
+    true_state = np.array([0.0, 0.6, np.deg2rad(45.0)])  # x, y, theta
+    measured_state = true_state.copy()
+    estimated_state = measured_state.copy()
+    ekf.initialize(measured_state)
     omega_prev = 0.0
 
     # Define ANY number of people here
@@ -298,9 +366,13 @@ def main():
     T = 20.0
     steps = int(T / cfg.dt)
 
-    traj = np.zeros((steps + 1, 3))
+    true_traj = np.zeros((steps + 1, 3))
+    measured_traj = np.zeros((steps + 1, 3))
+    estimated_traj = np.zeros((steps + 1, 3))
     omegas = np.zeros(steps)
-    traj[0] = state
+    true_traj[0] = true_state
+    measured_traj[0] = measured_state
+    estimated_traj[0] = estimated_state
 
     # store all people trajectories
     people_traj = [np.zeros((steps + 1, 2)) for _ in people]
@@ -308,7 +380,8 @@ def main():
         people_traj[i][0] = p.p.copy()
 
     # ---- live plot ----
-    plt.ion()
+    if not is_headless:
+        plt.ion()
     fig, ax = plt.subplots(figsize=(9, 4.2))
 
     # Static corridor drawing
@@ -324,9 +397,10 @@ def main():
     ax.set_title("Corridor MPC + multiple people + potential fields")
 
     # Live artists
-    path_line, = ax.plot([], [], linewidth=2.5)             # robot trail
-    robot_dot, = ax.plot([], [], marker="o", markersize=8)  # robot position
-    heading_line, = ax.plot([], [], linewidth=2.0)          # heading arrow
+    true_path_line, = ax.plot([], [], linewidth=2.0, label="True AMR path")
+    est_path_line, = ax.plot([], [], "--", linewidth=2.0, label="Estimated AMR path")
+    robot_dot, = ax.plot([], [], marker="o", markersize=8, label="Estimated AMR")
+    heading_line, = ax.plot([], [], linewidth=2.0)
 
     # People artists
     person_dots = []
@@ -338,7 +412,8 @@ def main():
         person_dots.append(d)
         person_lines.append(l)
 
-    xs, ys = [], []
+    true_xs, true_ys = [], []
+    est_xs, est_ys = [], []
 
     # Precompute PF grid (once)
     xg = np.arange(-0.5, L + 0.5 + cfg.pf_grid_dx, cfg.pf_grid_dx)
@@ -352,6 +427,8 @@ def main():
     levels_individual = np.array([0.2, 0.4, 0.6, 0.8])
     levels_combined = np.array([0.3, 0.6, 1.0, 1.6, 2.4])
 
+    measurement_noise = np.array(cfg.measurement_noise_std)
+
     for k in range(steps):
         # propagate all people
         for i, p in enumerate(people):
@@ -359,31 +436,39 @@ def main():
             people_traj[i][k + 1] = p.p.copy()
 
         # MPC solve
-        x_init = np.array([state[1], state[2]])
+        x_init = np.array([estimated_state[1], estimated_state[2]])
         omega = mpc.solve(
             x_init=x_init,
             u_prev=omega_prev,
-            robot_x0=float(state[0]),
+            robot_x0=float(estimated_state[0]),
             people=people
         )
 
-        # Simulate robot
-        # Add gaussian noise to simulate model mismatch + sensing noise
-        noise = np.random.randn(3) * np.array([0.03, 0.03, np.deg2rad(1.0)])
-        state = step_unicycle(state, v=cfg.vref, w=omega, dt=cfg.dt)
-        state += noise  # Add noise to the state
+        # Simulate true robot motion, then create a noisy measurement.
+        true_state = step_unicycle(true_state, v=cfg.vref, w=omega, dt=cfg.dt)
+        noise = rng.normal(size=3) * measurement_noise
+        measured_state = true_state + noise
+        measured_state[2] = wrap_angle(measured_state[2])
+
+        ekf.predict(v=cfg.vref, w=omega)
+        ekf.update(measured_state)
+        estimated_state = ekf.state.copy()
         omega_prev = omega
 
-        traj[k + 1] = state
+        true_traj[k + 1] = true_state
+        measured_traj[k + 1] = measured_state
+        estimated_traj[k + 1] = estimated_state
         omegas[k] = omega
 
         # Update robot visuals
-        xs.append(state[0]); ys.append(state[1])
-        path_line.set_data(xs, ys)
-        robot_dot.set_data([state[0]], [state[1]])
-        hx = state[0] + 0.5*np.cos(state[2])
-        hy = state[1] + 0.5*np.sin(state[2])
-        heading_line.set_data([state[0], hx], [state[1], hy])
+        true_xs.append(true_state[0]); true_ys.append(true_state[1])
+        est_xs.append(estimated_state[0]); est_ys.append(estimated_state[1])
+        true_path_line.set_data(true_xs, true_ys)
+        est_path_line.set_data(est_xs, est_ys)
+        robot_dot.set_data([estimated_state[0]], [estimated_state[1]])
+        hx = estimated_state[0] + 0.5 * np.cos(estimated_state[2])
+        hy = estimated_state[1] + 0.5 * np.sin(estimated_state[2])
+        heading_line.set_data([estimated_state[0], hx], [estimated_state[1], hy])
 
         # Update people visuals
         for i, p in enumerate(people):
@@ -411,33 +496,42 @@ def main():
                 cf = ax.contourf(X, Y, U_sum, levels=levels_combined, alpha=0.18)
                 pf_objects.append(cf)
 
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-        plt.pause(0.001)
+        if not is_headless:
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            plt.pause(0.001)
 
-        if state[0] > L:
-            traj = traj[:k + 2]
+        if true_state[0] > L:
+            true_traj = true_traj[:k + 2]
+            measured_traj = measured_traj[:k + 2]
+            estimated_traj = estimated_traj[:k + 2]
             omegas = omegas[:k + 1]
             for i in range(len(people_traj)):
                 people_traj[i] = people_traj[i][:k + 2]
             break
 
-    plt.ioff()
+    if not is_headless:
+        plt.ioff()
+
+    output_dir = Path(__file__).resolve().parents[1] / "outputs"
+    output_dir.mkdir(exist_ok=True)
 
     # ---- final plot ----
-    fig, ax = plt.subplots(figsize=(9, 4.2))
+    fig, ax = plt.subplots(figsize=(9, 4.8))
     ax.plot([0, L], [W / 2, W / 2], linewidth=2, label="Wall")
     ax.plot([0, L], [-W / 2, -W / 2], linewidth=2, label="Wall")
     ax.plot([0, L], [0, 0], "--", linewidth=1.5, label="Centerline")
-    ax.plot(traj[:, 0], traj[:, 1], linewidth=2.5, label="Robot path")
+    ax.plot(true_traj[:, 0], true_traj[:, 1], linewidth=2.5, label="True AMR path")
+    ax.plot(estimated_traj[:, 0], estimated_traj[:, 1], "--", linewidth=2.5, label="EKF estimate")
+    # ax.plot(measured_traj[:, 0], measured_traj[:, 1], ":", linewidth=1.6, alpha=0.75, label="Noisy measurement")
 
     for i, ptr in enumerate(people_traj):
         ax.plot(ptr[:, 0], ptr[:, 1], linewidth=2.0, label=f"Person {i} path")
 
     # Heading arrows every ~1m
     skip = max(1, int(1.0 / (cfg.vref * cfg.dt)))
-    for i in range(0, len(traj), skip):
-        x, y, th = traj[i]
+    for i in range(0, len(estimated_traj), skip):
+        x, y, th = estimated_traj[i]
         ax.arrow(x, y, 0.4 * np.cos(th), 0.4 * np.sin(th),
                  head_width=0.08, length_includes_head=True)
 
@@ -446,24 +540,42 @@ def main():
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    ax.set_title("Final trajectories")
+    ax.set_title("AMR trajectory: true vs noisy measurement vs EKF estimate")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
+    traj_plot_path = output_dir / "amr_true_vs_estimated_xy.png"
+    fig.savefig(traj_plot_path, dpi=180, bbox_inches="tight")
 
     # ---- time plot ----
-    t = np.arange(len(traj)) * cfg.dt
-    fig2, ax2 = plt.subplots(figsize=(9, 4.2))
-    ax2.plot(t, traj[:, 1], label="y [m]")
-    ax2.plot(t, np.rad2deg(traj[:, 2]), label="theta [deg]")
-    tu = np.arange(len(omegas)) * cfg.dt
-    ax2.plot(tu, np.rad2deg(omegas), label="omega [deg/s]")
-    ax2.set_xlabel("time [s]")
-    ax2.set_title("Tracking + control (multi-person APF bias)")
+    t = np.arange(len(true_traj)) * cfg.dt
+    fig2, (ax2, ax3) = plt.subplots(2, 1, figsize=(9, 7.0), sharex=True)
+    ax2.plot(t, true_traj[:, 0], linewidth=2.0, label="True x")
+    ax2.plot(t, estimated_traj[:, 0], "--", linewidth=2.0, label="Estimated x")
+    ax2.plot(t, true_traj[:, 1], linewidth=2.0, label="True y")
+    ax2.plot(t, estimated_traj[:, 1], "--", linewidth=2.0, label="Estimated y")
+    ax2.set_ylabel("position [m]")
+    ax2.set_title("Position estimate tracking")
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    ax2.legend(loc="best")
 
-    plt.show()
+    ax3.plot(t, np.rad2deg(true_traj[:, 2]), linewidth=2.0, label="True theta")
+    ax3.plot(t, np.rad2deg(estimated_traj[:, 2]), "--", linewidth=2.0, label="Estimated theta")
+    tu = np.arange(len(omegas)) * cfg.dt
+    ax3.plot(tu, np.rad2deg(omegas), linewidth=1.4, label="omega [deg/s]")
+    ax3.set_xlabel("time [s]")
+    ax3.set_ylabel("angle [deg]")
+    ax3.set_title("Heading estimate and control")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc="best")
+    fig2.tight_layout()
+    time_plot_path = output_dir / "amr_true_vs_estimated_time.png"
+    fig2.savefig(time_plot_path, dpi=180, bbox_inches="tight")
+
+    if not is_headless:
+        plt.show()
 
 
 if __name__ == "__main__":
     main()
+
+
